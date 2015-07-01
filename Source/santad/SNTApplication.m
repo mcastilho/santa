@@ -13,6 +13,7 @@
 ///    limitations under the License.
 
 #include <pwd.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 #import "SNTApplication.h"
@@ -26,6 +27,7 @@
 #import "SNTDriverManager.h"
 #import "SNTEventTable.h"
 #import "SNTExecutionController.h"
+#import "SNTFileWatcher.h"
 #import "SNTRuleTable.h"
 #import "SNTXPCConnection.h"
 #import "SNTXPCControlInterface.h"
@@ -35,6 +37,7 @@
 @property SNTDriverManager *driverManager;
 @property SNTEventTable *eventTable;
 @property SNTExecutionController *execController;
+@property SNTFileWatcher *configFileWatcher;
 @property SNTRuleTable *ruleTable;
 @property SNTXPCConnection *controlConnection;
 @property SNTXPCConnection *notifierConnection;
@@ -57,13 +60,13 @@
 
     // Initialize tables
     _ruleTable = [SNTDatabaseController ruleTable];
-    if (! _ruleTable) {
+    if (!_ruleTable) {
       LOGE(@"Failed to initialize rule table.");
       return nil;
     }
 
     _eventTable = [SNTDatabaseController eventTable];
-    if (! _eventTable) {
+    if (!_eventTable) {
       LOGE(@"Failed to initialize event table.");
       return nil;
     }
@@ -82,21 +85,19 @@
         [[SNTDaemonControlController alloc] initWithDriverManager:_driverManager];
     [_controlConnection resume];
 
-    // Get client mode and begin observing for updates
-    SNTConfigurator *configurator = [SNTConfigurator configurator];
-    santa_clientmode_t clientMode = [configurator clientMode];
-    BOOL logAllEvents = [configurator logAllEvents];
-    [configurator addObserver:self
-                   forKeyPath:@"clientMode"
-                      options:NSKeyValueObservingOptionNew
-                      context:NULL];
+    _configFileWatcher = [[SNTFileWatcher alloc] initWithFilePath:kDefaultConfigFilePath
+                                                          handler:^{
+        [[SNTConfigurator configurator] reloadConfigData];
+
+        // Ensure config file remains root:wheel 0644
+        chown([kDefaultConfigFilePath fileSystemRepresentation], 0, 0);
+        chmod([kDefaultConfigFilePath fileSystemRepresentation], 0644);
+    }];
 
     // Initialize the binary checker object
     _execController = [[SNTExecutionController alloc] initWithDriverManager:_driverManager
                                                                   ruleTable:_ruleTable
                                                                  eventTable:_eventTable
-                                                              operatingMode:clientMode
-                                                               logAllEvents:logAllEvents
                                                          notifierConnection:_notifierConnection];
     if (!_execController) return nil;
   }
@@ -104,28 +105,26 @@
   return self;
 }
 
-- (void)observeValueForKeyPath:(NSString *)keyPath
-                      ofObject:(id)object
-                        change:(NSDictionary *)change
-                       context:(void *)context {
-  if ([keyPath isEqual:@"clientMode"]) {
-    self.execController.operatingMode = [change[NSKeyValueChangeNewKey] intValue];
-  }
-}
-
 - (void)run {
   LOGI(@"Connected to driver, activating.");
 
-  dispatch_queue_t q = dispatch_queue_create("com.google.santad.driver_queue",
-                                             DISPATCH_QUEUE_CONCURRENT);
+  // Create a concurrent queue to put requests on, then set its priority to high.
+  dispatch_queue_t q =
+      dispatch_queue_create("com.google.santad.driver_queue", DISPATCH_QUEUE_CONCURRENT);
+  dispatch_set_target_queue(q, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0));
 
   [self.driverManager listenWithBlock:^(santa_message_t message) {
       @autoreleasepool {
         switch (message.action) {
           case ACTION_REQUEST_SHUTDOWN: {
             LOGI(@"Driver requested a shutdown");
-            // Sleep before exiting to give driver chance to ready itself
             exit(0);
+          }
+          case ACTION_NOTIFY_EXEC_ALLOW_NODAEMON:
+          case ACTION_NOTIFY_EXEC_ALLOW_CACHED:
+          case ACTION_NOTIFY_EXEC_DENY_CACHED: {
+            // TODO(rah): Implement.
+            break;
           }
           case ACTION_REQUEST_CHECKBW: {
             // Validate the binary aynchronously on a concurrent queue so we don't

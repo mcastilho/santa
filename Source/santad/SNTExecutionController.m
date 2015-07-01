@@ -14,12 +14,15 @@
 
 #import "SNTExecutionController.h"
 
+#include <libproc.h>
 #include <utmpx.h>
 
 #include "SNTLogging.h"
 
 #import "SNTCertificate.h"
 #import "SNTCodesignChecker.h"
+#import "SNTCommonEnums.h"
+#import "SNTConfigurator.h"
 #import "SNTDriverManager.h"
 #import "SNTDropRootPrivs.h"
 #import "SNTEventTable.h"
@@ -37,16 +40,12 @@
 - (instancetype)initWithDriverManager:(SNTDriverManager *)driverManager
                             ruleTable:(SNTRuleTable *)ruleTable
                            eventTable:(SNTEventTable *)eventTable
-                        operatingMode:(santa_clientmode_t)operatingMode
-                         logAllEvents:(BOOL)logAllEvents
                    notifierConnection:(SNTXPCConnection *)notifier {
   self = [super init];
   if (self) {
     _driverManager = driverManager;
     _ruleTable = ruleTable;
     _eventTable = eventTable;
-    _operatingMode = operatingMode;
-    _logAllEvents = logAllEvents;
     _notifierConnection = notifier;
     LOGI(@"Log format: Decision (A|D), Reason (B|C|S|?), SHA-256, Path, Cert SHA-256, Cert CN");
 
@@ -54,10 +53,6 @@
     // This establishes the XPC connection between libsecurity and syspolicyd.
     // Not doing this causes a deadlock as establishing this link goes through xpcproxy.
     (void)[[SNTCodesignChecker alloc] initWithSelf];
-
-    if (_logAllEvents) {
-      LOGI(@"Saving events for ALL executions due to configuration");
-    }
   }
   return self;
 }
@@ -75,6 +70,10 @@
   // These will be filled in either in later steps
   santa_action_t respondedAction = ACTION_UNSET;
   SNTRule *rule;
+
+  // Get name of parent process. Do this before responding to be sure parent doesn't go away.
+  char pname[PROC_PIDPATHINFO_MAXSIZE];
+  proc_name([ppid intValue], pname, PROC_PIDPATHINFO_MAXSIZE);
 
   // Step 1 - binary rule?
   rule = [self.ruleTable binaryRuleForSHA256:sha256];
@@ -108,7 +107,9 @@
   }
 
   // Step 5 - log to database and potentially alert user
-  if (respondedAction == ACTION_RESPOND_CHECKBW_DENY || !rule || self.logAllEvents) {
+  if (respondedAction == ACTION_RESPOND_CHECKBW_DENY ||
+      !rule ||
+      [[SNTConfigurator configurator] logAllEvents]) {
     SNTStoredEvent *se = [[SNTStoredEvent alloc] init];
     se.fileSHA256 = sha256;
     se.filePath = path;
@@ -129,6 +130,7 @@
     se.decision = [self eventStateForDecision:respondedAction type:rule.type];
     se.pid = pid;
     se.ppid = ppid;
+    se.parentName = @(pname);
 
     NSArray *loggedInUsers, *currentSessions;
     [self loggedInUsers:&loggedInUsers sessions:&currentSessions];
@@ -140,14 +142,16 @@
     if (respondedAction == ACTION_RESPOND_CHECKBW_DENY) {
       // So the server has something to show the user straight away, initiate an event
       // upload for the blocked binary rather than waiting for the next sync.
-      // The event upload is skipped if the full path is equal to that of /usr/sbin/santactl so that
+      // The event upload is skipped if the full path is equal to that of santactl so that
       /// on the off chance that santactl is not whitelisted, we don't get into an infinite loop.
-      if (![path isEqual:@"/usr/sbin/santactl"]) {
+      if (![path isEqual:@(kSantaCtlPath)]) {
         [self initiateEventUploadForSHA256:sha256];
       }
 
-      [[self.notifierConnection remoteObjectProxy] postBlockNotification:se
-                                                       withCustomMessage:rule.customMsg];
+      if (!rule || rule.state != RULESTATE_SILENT_BLACKLIST) {
+        [[self.notifierConnection remoteObjectProxy] postBlockNotification:se
+                                                         withCustomMessage:rule.customMsg];
+      }
     }
   }
 
@@ -162,7 +166,7 @@
 ///  Checks whether the file at @c path is in-scope for checking with Santa.
 ///
 ///  Files that are out of scope:
-///    + Non Mach-O files
+///    + Non Mach-O files that are not part of an installer package.
 ///    + Files in whitelisted directories.
 ///
 ///  @return @c YES if file is in scope, @c NO otherwise.
@@ -173,10 +177,11 @@
     return NO;
   }
 
-  // If file is not a Mach-O file, we're not interested.
-  // TODO(rah): Consider adding an option to check scripts
+  // If file is not a Mach-O file, we're not interested unless it's part of an install package.
+  // TODO(rah): Consider adding an option to check all scripts.
+  // TODO(rah): Consider adding an option to disable package script checks.
   SNTFileInfo *binInfo = [[SNTFileInfo alloc] initWithPath:path];
-  if (![binInfo isMachO]) {
+  if (![binInfo isMachO] && ![path hasPrefix:@"/private/tmp/PKInstallSandbox."]) {
     return NO;
   }
 
@@ -240,8 +245,8 @@
 
   if (cert && cert.SHA256 && cert.commonName) {
     // Also ensure there are no pipes in the cert's common name.
-    NSString *printCommonName = [cert.commonName stringByReplacingOccurrencesOfString:@"|"
-                                                                           withString:@"<pipe>"];
+    NSString *printCommonName =
+        [cert.commonName stringByReplacingOccurrencesOfString:@"|" withString:@"<pipe>"];
     outLog = [NSString stringWithFormat:@"%@|%@|%@|%@|%@|%@",
                  d, r, sha256, printPath, cert.SHA256, printCommonName];
   } else {
@@ -262,24 +267,18 @@
 
     // Ensure we have no privileges
     if (!DropRootPrivileges()) {
-      exit(1);
+      _exit(1);
     }
 
-    exit(execl("/usr/sbin/santactl", "/usr/sbin/santactl", "sync",
-               "singleevent", [sha256 UTF8String], NULL));
+    _exit(execl(kSantaCtlPath, kSantaCtlPath, "sync", "singleevent", [sha256 UTF8String], NULL));
   }
 }
 
 - (santa_action_t)defaultDecision {
-  switch (self.operatingMode) {
-    case CLIENTMODE_MONITOR:
-      return ACTION_RESPOND_CHECKBW_ALLOW;
-    case CLIENTMODE_LOCKDOWN:
-      return ACTION_RESPOND_CHECKBW_DENY;
-    default:
-      // This should never happen, panic and lockdown.
-      LOGE(@"Client mode is unset while enforcement is in effect. Blocking.");
-      return ACTION_RESPOND_CHECKBW_DENY;
+  switch ([[SNTConfigurator configurator] clientMode]) {
+    case CLIENTMODE_MONITOR: return ACTION_RESPOND_CHECKBW_ALLOW;
+    case CLIENTMODE_LOCKDOWN: return ACTION_RESPOND_CHECKBW_DENY;
+    default: return ACTION_RESPOND_CHECKBW_DENY;  // This can't happen.
   }
 }
 
@@ -313,12 +312,12 @@
       sessionName = [NSString stringWithFormat:@"%s@%s", nxt->ut_user, nxt->ut_line];
     }
 
-    if (userName && ![userName isEqual:@""]) {
-      loggedInUsers[userName] = @"";
+    if ([userName length] > 0) {
+      loggedInUsers[userName] = [NSNull null];
     }
 
-    if (sessionName && ![sessionName isEqual:@":"]) {
-      loggedInHosts[sessionName] = @"";
+    if ([sessionName length] > 1) {
+      loggedInHosts[sessionName] = [NSNull null];
     }
   }
 

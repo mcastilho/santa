@@ -83,7 +83,7 @@ static const int MAX_DELAY = 15;
   IOServiceClose(_connection);
 }
 
-# pragma mark Incoming messages
+#pragma mark Incoming messages
 
 - (void)listenWithBlock:(void (^)(santa_message_t message))callback {
   kern_return_t kr;
@@ -108,8 +108,9 @@ static const int MAX_DELAY = 15;
     return;
   }
 
-  // This will call clientMemoryForType() inside our user client class,
-  // which activates the Kauth listeners.
+  // This will call clientMemoryForType() inside our user client class.
+  // The Kauth listener will start intercepting at this point and sending requests
+  // to our queue.
   kr = IOConnectMapMemory(self.connection, kIODefaultMemoryType, mach_task_self(),
                           &address, &size, kIOMapAnywhere);
   if (kr != kIOReturnSuccess) {
@@ -121,18 +122,17 @@ static const int MAX_DELAY = 15;
   self.queueMemory = (IODataQueueMemory *)address;
   dataSize = sizeof(vdata);
 
-  while (IODataQueueWaitForAvailableData(self.queueMemory,
-                                         self.receivePort) == kIOReturnSuccess) {
+  do {
     while (IODataQueueDataAvailable(self.queueMemory)) {
       kr = IODataQueueDequeue(self.queueMemory, &vdata, &dataSize);
       if (kr == kIOReturnSuccess) {
         callback(vdata);
       } else {
-        LOGD(@"Error receiving data: %d", kr);
+        LOGE(@"Error dequeuing data: %d", kr);
         exit(2);
       }
     }
-  }
+  } while (IODataQueueWaitForAvailableData(self.queueMemory, self.receivePort) == kIOReturnSuccess);
 
   IOConnectUnmapMemory(self.connection, kIODefaultMemoryType, mach_task_self(), address);
   mach_port_destroy(mach_task_self(), self.receivePort);

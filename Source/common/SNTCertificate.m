@@ -80,9 +80,9 @@ static NSString *const kCertDataKey = @"certData";
   NSData *output = nil;
 
   if (SecTransformSetAttribute(transform,
-                             kSecTransformInputAttributeName,
-                             (__bridge CFDataRef)input,
-                             NULL)) {
+                               kSecTransformInputAttributeName,
+                               (__bridge CFDataRef)input,
+                               NULL)) {
     output = CFBridgingRelease(SecTransformExecute(transform, NULL));
   }
   if (transform) CFRelease(transform);
@@ -126,11 +126,12 @@ static NSString *const kCertDataKey = @"certData";
 
 #pragma mark Equality & description
 
-- (BOOL)isEqual:(SNTCertificate *)other {
+- (BOOL)isEqual:(id)other {
   if (self == other) return YES;
   if (![other isKindOfClass:[SNTCertificate class]]) return NO;
 
-  return [self.certData isEqual:other.certData];
+  SNTCertificate *o = other;
+  return [self.certData isEqual:o.certData];
 }
 
 - (NSUInteger)hash {
@@ -138,10 +139,8 @@ static NSString *const kCertDataKey = @"certData";
 }
 
 - (NSString *)description {
-  return [NSString stringWithFormat:@"/O=%@/OU=%@/CN=%@",
-          self.orgName,
-          self.orgUnit,
-          self.commonName];
+  return
+      [NSString stringWithFormat:@"/O=%@/OU=%@/CN=%@", self.orgName, self.orgUnit, self.commonName];
 }
 
 #pragma mark NSSecureCoding
@@ -227,7 +226,7 @@ static NSString *const kCertDataKey = @"certData";
     }
     return nil;
   }
-  @catch (NSException *exception) {
+  @catch (NSException *e) {
     return nil;
   }
 }

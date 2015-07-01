@@ -16,28 +16,32 @@
 
 #include "SNTLogging.h"
 
-#import "SNTCommandSyncStatus.h"
+#import "SNTCommandSyncConstants.h"
+#import "SNTCommandSyncState.h"
 
 @implementation SNTCommandSyncPostflight
 
 + (void)performSyncInSession:(NSURLSession *)session
-                    progress:(SNTCommandSyncStatus *)progress
+                   syncState:(SNTCommandSyncState *)syncState
                   daemonConn:(SNTXPCConnection *)daemonConn
            completionHandler:(void (^)(BOOL success))handler {
-  NSURL *url = [NSURL URLWithString:[@"postflight/" stringByAppendingString:progress.machineID]
-                      relativeToURL:progress.syncBaseURL];
+  NSURL *url = [NSURL URLWithString:[kURLPostflight stringByAppendingString:syncState.machineID]
+                      relativeToURL:syncState.syncBaseURL];
   NSMutableURLRequest *req = [[NSMutableURLRequest alloc] initWithURL:url];
   [req setHTTPMethod:@"POST"];
 
   [[session dataTaskWithRequest:req completionHandler:^(NSData *data,
                                                         NSURLResponse *response,
                                                         NSError *error) {
-    if ([(NSHTTPURLResponse *)response statusCode] != 200) {
-      LOGD(@"HTTP Response Code: %d", [(NSHTTPURLResponse *)response statusCode]);
-      handler(NO);
-    } else {
-      handler(YES);
-    }
+      long statusCode = [(NSHTTPURLResponse *)response statusCode];
+      if (statusCode != 200) {
+        LOGE(@"HTTP Response: %d %@",
+             statusCode,
+             [[NSHTTPURLResponse localizedStringForStatusCode:statusCode] capitalizedString]);
+        handler(NO);
+      } else {
+        handler(YES);
+      }
   }] resume];
 }
 

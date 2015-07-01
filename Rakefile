@@ -1,46 +1,24 @@
 require 'timeout'
 
-WORKSPACE       = 'Santa.xcworkspace'
-DEFAULT_SCHEME  = 'All'
-OUTPUT_PATH     = 'Build'
-DIST_PATH       = 'Dist'
-BINARIES        = ['Santa.app', 'santa-driver.kext', 'santad', 'santactl']
-XCTOOL_DEFAULTS = "-workspace #{WORKSPACE}"
-XCODE_DEFAULTS  = "-workspace #{WORKSPACE} -derivedDataPath #{OUTPUT_PATH} -parallelizeTargets"
+WORKSPACE           = 'Santa.xcworkspace'
+DEFAULT_SCHEME      = 'All'
+OUTPUT_PATH         = 'Build'
+DIST_PATH           = 'Dist'
+BINARIES            = ['Santa.app', 'santa-driver.kext']
+XCPRETTY_DEFAULTS   = '-sc'
+XCODEBUILD_DEFAULTS = "-workspace #{WORKSPACE} -derivedDataPath #{OUTPUT_PATH} -parallelizeTargets"
 
 task :default do
   system("rake -sT")
 end
 
-def xctool_available
-  return system 'xctool --version >/dev/null 2>&1'
-end
-
-def run_and_output_on_fail(cmd)
-  output=`#{cmd} 2>&1`
-  if not $?.success?
-    raise output
-  end
-end
-
-def run_and_output_with_color(cmd)
-  output=`#{cmd} 2>&1`
-
-  has_output = false
-  output.scan(/((Test Suite|Test Case|Executed).*)$/) do |match|
-    has_output = true
-    out = match[0]
-    if out.include?("passed")
-      puts "\e[32m#{out}\e[0m"
-    elsif out.include?("failed")
-      puts "\e[31m#{out}\e[0m"
-    else
-      puts out
-    end
-  end
-
-  if not has_output
-    raise output
+def xcodebuild(opts)
+  if system "xcodebuild #{XCODEBUILD_DEFAULTS} #{opts} | " \
+      "xcpretty #{XCPRETTY_DEFAULTS} && " \
+      "exit ${PIPESTATUS[0]}"
+    puts "\e[32mPass\e[0m"
+  else
+    raise "\e[31mFail\e[0m"
   end
 end
 
@@ -49,19 +27,20 @@ task :init do
     puts "Pods missing, running 'pod install'"
     system "pod install" or raise "CocoaPods is not installed. Install with 'sudo gem install cocoapods'"
   end
+  unless system 'xcpretty -v >/dev/null 2>&1'
+    puts "xcpretty is not installed. Install with 'sudo gem install xcpretty'"
+  end
 end
 
 task :remove_existing do
-  system 'sudo rm -rf /santa-driver.kext'
+  system 'sudo rm -rf /Library/Extensions/santa-driver.kext'
   system 'sudo rm -rf /Applications/Santa.app'
-  system 'sudo rm /usr/libexec/santad'
-  system 'sudo rm /usr/sbin/santactl'
 end
 
 desc "Clean"
 task :clean => :init do
   puts "Cleaning"
-  system "xcodebuild #{XCODE_DEFAULTS} -scheme All clean"
+  xcodebuild("-scheme All clean")
   FileUtils.rm_rf(OUTPUT_PATH)
   FileUtils.rm_rf(DIST_PATH)
 end
@@ -81,11 +60,7 @@ namespace :build do
   task :build, [:configuration] => :init do |t, args|
     config = args[:configuration]
     puts "Building with configuration: #{config}"
-    if xctool_available
-      system "xctool #{XCTOOL_DEFAULTS} -scheme All -configuration #{config} build"
-    else
-      system "xcodebuild #{XCODE_DEFAULTS} -scheme All -configuration #{config} build"
-    end
+    xcodebuild("-scheme All -configuration #{config} build")
   end
 end
 
@@ -111,10 +86,8 @@ namespace :install do
     Rake::Task['build:build'].invoke(config)
     puts "Installing with configuration: #{config}"
     Rake::Task['remove_existing'].invoke()
-    system "sudo cp -r #{OUTPUT_PATH}/Products/#{config}/santa-driver.kext /"
+    system "sudo cp -r #{OUTPUT_PATH}/Products/#{config}/santa-driver.kext /Library/Extensions"
     system "sudo cp -r #{OUTPUT_PATH}/Products/#{config}/Santa.app /Applications"
-    system "sudo cp #{OUTPUT_PATH}/Products/#{config}/santad /usr/libexec"
-    system "sudo cp #{OUTPUT_PATH}/Products/#{config}/santactl /usr/sbin"
   end
 end
 
@@ -135,7 +108,7 @@ task :dist do
     FileUtils.cp_r("#{OUTPUT_PATH}/Products/Release/#{x}.dSYM", "#{DIST_PATH}/dsym")
   end
 
-  Dir.glob("Conf/*") {|x| FileUtils.cp(x, "#{DIST_PATH}/conf")}
+  Dir.glob("Conf/*") {|x| File.directory?(x) or FileUtils.cp(x, "#{DIST_PATH}/conf")}
 
   puts "Distribution folder created"
 end
@@ -145,11 +118,7 @@ namespace :tests do
   desc "Tests: Logic"
   task :logic => [:init] do
     puts "Running logic tests"
-    if xctool_available
-      system "xctool #{XCTOOL_DEFAULTS} -scheme LogicTests test"
-    else
-      system "xcodebuild #{XCODE_DEFAULTS} -scheme LogicTests test"
-    end
+    xcodebuild("-scheme LogicTests test")
   end
 
   desc "Tests: Kernel"
@@ -196,7 +165,7 @@ end
 
 task :load_kext do
   puts "Loading kernel extension"
-  system "sudo kextload /santa-driver.kext"
+  system "sudo kextload /Library/Extensions/santa-driver.kext"
 end
 
 task :load_gui do
